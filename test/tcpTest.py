@@ -1,4 +1,5 @@
 import socket
+import time
 
 
 def sendRequest(message):
@@ -12,10 +13,27 @@ def sendRequest(message):
         client.sendall((message + "\n").encode("utf-8"))
 
         data = client.recv(1024)
-        print(f"Received: {data.decode('utf-8')}")
+        decoded = data.decode("utf-8").strip()
+        print(f"Received: {decoded}")
         print("-" * 20)
+
+        return decoded
 
 
 if __name__ == "__main__":
-    sendRequest("add 420")
-    sendRequest("get")
+    jobs = [10, 12, 15, 42, 67, 69, 420, 6969]
+
+    for job in jobs:
+        sendRequest(f"add {job}")
+
+    time.sleep(10)
+
+    returnedJobs = []
+
+    for _ in jobs:
+        result = sendRequest("get")
+        returnedJobs.append(result)
+
+    print(jobs)
+    print("-" * 20)
+    print(returnedJobs)
