@@ -1,0 +1,191 @@
+use TaxiWay::ThreadPool;
+use std::{
+    collections::VecDeque,
+    error::Error,
+    fs,
+    io::{BufRead, BufReader, prelude::*},
+    net::{TcpListener, TcpStream},
+    result,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+pub enum SubmitError {
+    InvalidFormat,
+    NotANumber,
+    EmptyInput,
+    NoOpcode,
+}
+
+/// Struct that holds the data of a job.
+/// Currently not representative of the final desing.
+struct JobData {
+    data: Vec<u8>,
+}
+
+impl JobData {
+    pub fn create_job_data(&self, data: Vec<u8>) -> JobData {
+        JobData { data: data }
+    }
+}
+
+/// Struct that represents a Job.
+/// A job has an id and its associated data.
+struct Job {
+    id: usize,
+    data: JobData,
+}
+
+impl Job {
+    pub fn create_job(&self, id: usize, data: JobData) -> Job {
+        Job { id: id, data: data }
+    }
+}
+
+/// Struct that represnts the job queue.
+/// The queue holds objects of the Job Struct.
+/// Has a mutex lock to ensure that there are no race conditions.
+struct JobQueue {
+    jobs: Mutex<VecDeque<Job>>,
+    next_job_id: AtomicUsize,
+}
+
+impl JobQueue {
+    pub fn submit_job(&self, tcp_in: Vec<u8>) -> Result<usize, SubmitError> {
+        // read the opcode
+        let opcode: u8 = match tcp_in.get(0) {
+            Some(byte) => *byte,
+            None => return Err(SubmitError::InvalidFormat),
+        };
+
+        // get the length of the data
+        let data_len: &[u8] = &tcp_in[1..5];
+        let int_data_len = u32::from_be_bytes(data_len.try_into().unwrap());
+        if int_data_len == 0 {
+            return Err(SubmitError::EmptyInput);
+        }
+
+        //read data and put it into the queue
+        let data_end = 5 + (int_data_len as usize);
+        if tcp_in.len() < data_end {
+            return Err(SubmitError::InvalidFormat);
+        }
+        let data = &tcp_in[5..data_end];
+        // make data owned and a Vec<u8> to move it into the struct
+        let data = data.to_vec();
+        let job_data = JobData { data: data };
+
+        let id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
+        let job = Job {
+            id: id,
+            data: job_data,
+        };
+
+        self.add_job(job);
+
+        Ok(id)
+    }
+
+    /// Returns the first job in the queue and its associated data
+    pub fn return_job(&self) -> Vec<u8> {
+        let job = match self.get_job() {
+            Some(job) => job,
+            None => return Vec::new(),
+        };
+        let id = (job.id as u64).to_be_bytes();
+        let data_len = job.data.data.len() as u32;
+        let data_len_bytes = data_len.to_be_bytes();
+
+        let vec_cap = 8 + 4 + data_len as usize;
+        let mut result = Vec::with_capacity(vec_cap);
+
+        //add the 8 id bytes to the start of the result vec
+        result.extend_from_slice(&id);
+        // add the 4 length bytes
+        result.extend_from_slice(&data_len_bytes);
+        // add the data
+        result.extend_from_slice(&job.data.data);
+
+        // retun it
+        result
+    }
+
+    /// Function to add job to the job queue
+    /// always adds to back of the queue.
+    fn add_job(&self, job: Job) {
+        self.jobs.lock().unwrap().push_back(job);
+    }
+
+    /// Function to get job from the job queue
+    /// always gets the job at the start of the queue
+    fn get_job(&self) -> Option<Job> {
+        self.jobs.lock().unwrap().pop_front()
+    }
+}
+
+fn main() {
+    let queue = Arc::new(JobQueue {
+        jobs: Mutex::new(VecDeque::new()),
+        next_job_id: AtomicUsize::new(0),
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:8294").unwrap();
+    let pool = ThreadPool::new(4);
+
+    for stream in listener.incoming() {
+        let stream = stream.unwrap();
+        let queue_clone = Arc::clone(&queue);
+        pool.execute(|| {
+            handle_connection(stream, queue_clone);
+        });
+    }
+}
+
+fn handle_connection(mut stream: TcpStream, queue: Arc<JobQueue>) {
+    let mut buf_reader = BufReader::new(&stream);
+    let data = match buf_reader.fill_buf() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Error reading from stream: {}", e);
+            return;
+        }
+    };
+    let opcode = data.get(0).copied();
+
+    let response = match opcode {
+        Some(1) => {
+            let mut data_vec = Vec::new();
+            data_vec.extend_from_slice(data);
+
+            match queue.submit_job(data_vec) {
+                Ok(id) => {
+                    let mut result = vec![0];
+                    result.extend_from_slice(&(id as u32).to_be_bytes());
+                    result
+                }
+                Err(_) => vec![1], // error
+            }
+        }
+        Some(2) => {
+            let job_bytes = queue.return_job();
+
+            if job_bytes.is_empty() {
+                vec![1] // error
+            } else {
+                let mut result = vec![0];
+                result.extend_from_slice(&job_bytes);
+                result
+            }
+        }
+        Some(_) => vec![2], // invalid opcode
+        None => vec![3],    // emty request
+    };
+
+    if let Err(e) = stream.write_all(&response) {
+        eprintln!("Failed to send response: {}", e);
+    }
+}
