@@ -1,17 +1,13 @@
 use TaxiWay::ThreadPool;
 use std::{
-    collections::VecDeque,
-    error::Error,
-    fs,
+    collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, prelude::*},
     net::{TcpListener, TcpStream},
-    result,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    thread,
-    time::Duration,
+    time::Instant,
 };
 
 pub enum SubmitError {
@@ -21,43 +17,42 @@ pub enum SubmitError {
     NoOpcode,
 }
 
+pub enum HashMapError {
+    NoJob,
+}
+
 /// Struct that holds the data of a job.
 /// Currently not representative of the final desing.
+#[derive(Clone)]
 struct JobData {
     data: Vec<u8>,
 }
 
-impl JobData {
-    pub fn create_job_data(&self, data: Vec<u8>) -> JobData {
-        JobData { data: data }
-    }
-}
-
 /// Struct that represents a Job.
 /// A job has an id and its associated data.
+#[derive(Clone)]
 struct Job {
     id: usize,
     data: JobData,
+    sent: Option<Instant>,
 }
 
-impl Job {
-    pub fn create_job(&self, id: usize, data: JobData) -> Job {
-        Job { id: id, data: data }
-    }
-}
-
-/// Struct that represnts the job queue.
+// Struct that represnts the job queue.
 /// The queue holds objects of the Job Struct.
 /// Has a mutex lock to ensure that there are no race conditions.
 struct JobQueue {
     jobs: Mutex<VecDeque<Job>>,
     next_job_id: AtomicUsize,
+    pending_jobs: Mutex<HashMap<usize, Job>>,
 }
 
 impl JobQueue {
+    /// Function to add a job to the back of the queue. Checks the opcode for correctness.
+    /// Checks the following 4 bytes for the length of the data.
+    /// Saves the data and a jobid in the queue.
     pub fn submit_job(&self, tcp_in: Vec<u8>) -> Result<usize, SubmitError> {
         // read the opcode
-        let opcode: u8 = match tcp_in.get(0) {
+        let _opcode: u8 = match tcp_in.get(0) {
             Some(byte) => *byte,
             None => return Err(SubmitError::InvalidFormat),
         };
@@ -83,6 +78,7 @@ impl JobQueue {
         let job = Job {
             id: id,
             data: job_data,
+            sent: None,
         };
 
         self.add_job(job);
@@ -92,10 +88,20 @@ impl JobQueue {
 
     /// Returns the first job in the queue and its associated data
     pub fn return_job(&self) -> Vec<u8> {
-        let job = match self.get_job() {
+        let mut job = match self.get_job() {
             Some(job) => job,
             None => return Vec::new(),
         };
+
+        //set the send time of the job before adding it to the HashMap
+        job.sent = Some(Instant::now());
+
+        // Adding the job to the pending_jobs HashMap
+        self.pending_jobs
+            .lock()
+            .unwrap()
+            .insert(job.id, job.clone());
+
         let id = (job.id as u64).to_be_bytes();
         let data_len = job.data.data.len() as u32;
         let data_len_bytes = data_len.to_be_bytes();
@@ -112,6 +118,16 @@ impl JobQueue {
 
         // retun it
         result
+    }
+
+    ///Function to remove an acked job from the pending queue.
+    pub fn removed_acked_job(&self, tcp_in: Vec<u8>) -> Result<(), HashMapError> {
+        let job_id: &[u8] = &tcp_in[1..9];
+        let id = usize::from_be_bytes(job_id.try_into().unwrap());
+        match self.pending_jobs.lock().unwrap().remove(&id) {
+            Some(_) => Ok(()),
+            None => Err(HashMapError::NoJob),
+        }
     }
 
     /// Function to add job to the job queue
@@ -131,6 +147,7 @@ fn main() {
     let queue = Arc::new(JobQueue {
         jobs: Mutex::new(VecDeque::new()),
         next_job_id: AtomicUsize::new(0),
+        pending_jobs: Mutex::new(HashMap::new()),
     });
 
     let listener = TcpListener::bind("127.0.0.1:8294").unwrap();
@@ -145,6 +162,22 @@ fn main() {
     }
 }
 
+/// Gets called on an incoming TCP stream. Checks the first byte for the opcode.
+/// Depending on the opcode runs the appropriate code.
+/// Opcodes:
+///     [1] => Adds the send data to the queue and sends back the job id.
+///     [2] => Retirves the Job in the front of the queue returns it and the id.
+///     [3] => ACKnowledgement by the sender that the job with the provided id is recived and
+///     can be deleted from the queue.
+///     [4] => TODO NACK changes the state of a job from in progess(meaning it was sent by get[2]
+///     but not yet ACK'ed) back to ready.
+///     [5] => TODO Returns the number of items in the queue.
+///     [6] => TODO Pings the server to check if its running
+/// Return Codes:
+///     [0] => Indicates success. If data is send back its appended after the return code.
+///     [1] => Indicates an error
+///     [2] => indicates an invalid opcode
+///     [3] => indicates an empty request
 fn handle_connection(mut stream: TcpStream, queue: Arc<JobQueue>) {
     let mut buf_reader = BufReader::new(&stream);
     let data = match buf_reader.fill_buf() {
@@ -181,6 +214,18 @@ fn handle_connection(mut stream: TcpStream, queue: Arc<JobQueue>) {
                 result
             }
         }
+        Some(3) => {
+            let mut data_vec = Vec::new();
+            data_vec.extend_from_slice(data);
+
+            match queue.removed_acked_job(data_vec) {
+                Ok(()) => vec![0],
+                Err(_) => vec![1],
+            }
+        }
+        //Some(4) => {}
+        //Some(5) => {}
+        //Some(6) => {}
         Some(_) => vec![2], // invalid opcode
         None => vec![3],    // emty request
     };
