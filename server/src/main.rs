@@ -37,7 +37,7 @@ struct Job {
     sent: Option<Instant>,
 }
 
-// Struct that represnts the job queue.
+/// Struct that represnts the job queue.
 /// The queue holds objects of the Job Struct.
 /// Has a mutex lock to ensure that there are no race conditions.
 struct JobQueue {
@@ -130,6 +130,10 @@ impl JobQueue {
         }
     }
 
+    pub fn get_queue_length(&self) -> usize {
+        self.jobs.lock().unwrap().len()
+    }
+
     /// Function to add job to the job queue
     /// always adds to back of the queue.
     fn add_job(&self, job: Job) {
@@ -171,7 +175,7 @@ fn main() {
 ///     can be deleted from the queue.
 ///     [4] => TODO NACK changes the state of a job from in progess(meaning it was sent by get[2]
 ///     but not yet ACK'ed) back to ready.
-///     [5] => TODO Returns the number of items in the queue.
+///     [5] => Returns only the number of items in the queue no return code.
 ///     [6] => TODO Pings the server to check if its running
 /// Return Codes:
 ///     [0] => Indicates success. If data is send back its appended after the return code.
@@ -224,7 +228,12 @@ fn handle_connection(mut stream: TcpStream, queue: Arc<JobQueue>) {
             }
         }
         //Some(4) => {}
-        //Some(5) => {}
+        Some(5) => {
+            let queue_length = queue.get_queue_length().to_be_bytes();
+            let mut result = Vec::new();
+            result.extend_from_slice(&queue_length);
+            result
+        }
         //Some(6) => {}
         Some(_) => vec![2], // invalid opcode
         None => vec![3],    // emty request
