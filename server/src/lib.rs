@@ -55,7 +55,7 @@ impl Worker {
         let thread = thread::spawn(move || {
             loop {
                 let job = receiver.lock().unwrap().recv().unwrap();
-                println!("Worker {id} got a job; executing.");
+                //println!("Worker {id} got a job; executing.");
 
                 job();
             }
@@ -64,4 +64,3 @@ impl Worker {
         Worker { id, thread }
     }
 }
-
