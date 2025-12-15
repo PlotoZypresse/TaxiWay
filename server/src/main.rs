@@ -176,12 +176,13 @@ fn main() {
 ///     [4] => TODO NACK changes the state of a job from in progess(meaning it was sent by get[2]
 ///     but not yet ACK'ed) back to ready.
 ///     [5] => Returns only the number of items in the queue no return code.
-///     [6] => TODO Pings the server to check if its running
+///     [6] => Pings the server to check if its running, returns Return Code [69]
 /// Return Codes:
 ///     [0] => Indicates success. If data is send back its appended after the return code.
 ///     [1] => Indicates an error
 ///     [2] => indicates an invalid opcode
 ///     [3] => indicates an empty request
+///     [69] => indicates that the server is running and ready
 fn handle_connection(mut stream: TcpStream, queue: Arc<JobQueue>) {
     let mut buf_reader = BufReader::new(&stream);
     let data = match buf_reader.fill_buf() {
@@ -234,7 +235,7 @@ fn handle_connection(mut stream: TcpStream, queue: Arc<JobQueue>) {
             result.extend_from_slice(&queue_length);
             result
         }
-        //Some(6) => {}
+        Some(6) => vec![69],
         Some(_) => vec![2], // invalid opcode
         None => vec![3],    // emty request
     };
