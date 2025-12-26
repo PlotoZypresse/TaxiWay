@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -177,6 +178,15 @@ fn main() {
     let listener = TcpListener::bind("127.0.0.1:8294").unwrap();
     let pool = ThreadPool::new(32);
 
+    let requeue_queue = Arc::clone(&queue);
+    thread::spawn(move || {
+        loop {
+            requeue(&requeue_queue);
+            println!("Some one removed unacked jobs");
+            thread::sleep(Duration::from_secs(30));
+        }
+    });
+
     for stream in listener.incoming() {
         let stream = stream.unwrap();
         let queue_clone = Arc::clone(&queue);
@@ -200,10 +210,16 @@ fn requeue(job_queue: &JobQueue) {
             Some(root) => root,
             None => return,
         };
+        let mut pending_jobs = job_queue.pending_jobs.lock().unwrap();
 
-        let job_id = root.id;
-        job_queue.pending_jobs.lock().unwrap().remove(&job_id);
-        job_queue.add_job(root);
+        if pending_jobs.remove(&root.id).is_some() {
+            //let mut jobs = job_queue.jobs.lock().unwrap();
+            let mut requeue_job = root;
+            requeue_job.sent = None;
+
+            println!("Job {}, Was requeud due to Ack time out", requeue_job.id);
+            job_queue.add_job(requeue_job);
+        }
     }
 }
 
