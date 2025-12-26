@@ -182,7 +182,6 @@ fn main() {
     thread::spawn(move || {
         loop {
             requeue(&requeue_queue);
-            println!("Some one removed unacked jobs");
             thread::sleep(Duration::from_secs(30));
         }
     });
