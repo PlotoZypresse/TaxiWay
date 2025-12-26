@@ -1,13 +1,13 @@
 use TaxiWay::ThreadPool;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BinaryHeap, HashMap, VecDeque},
     io::{BufRead, BufReader, prelude::*},
     net::{TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub enum SubmitError {
@@ -23,14 +23,14 @@ pub enum HashMapError {
 
 /// Struct that holds the data of a job.
 /// Currently not representative of the final desing.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct JobData {
     data: Vec<u8>,
 }
 
 /// Struct that represents a Job.
 /// A job has an id and its associated data.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Job {
     id: usize,
     data: JobData,
@@ -44,6 +44,22 @@ struct JobQueue {
     jobs: Mutex<VecDeque<Job>>,
     next_job_id: AtomicUsize,
     pending_jobs: Mutex<HashMap<usize, Job>>,
+    unacked_jobs: Mutex<BinaryHeap<Job>>,
+}
+
+impl PartialOrd for Job {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Job {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let time1 = self.sent;
+        let time2 = other.sent;
+
+        time2.cmp(&time1).then_with(|| self.id.cmp(&other.id))
+    }
 }
 
 impl JobQueue {
@@ -102,6 +118,9 @@ impl JobQueue {
             .unwrap()
             .insert(job.id, job.clone());
 
+        // add job to the BinaryHeap
+        self.unacked_jobs.lock().unwrap().push(job.clone());
+
         let id = (job.id as u64).to_be_bytes();
         let data_len = job.data.data.len() as u32;
         let data_len_bytes = data_len.to_be_bytes();
@@ -152,6 +171,7 @@ fn main() {
         jobs: Mutex::new(VecDeque::new()),
         next_job_id: AtomicUsize::new(0),
         pending_jobs: Mutex::new(HashMap::new()),
+        unacked_jobs: Mutex::new(BinaryHeap::new()),
     });
 
     let listener = TcpListener::bind("127.0.0.1:8294").unwrap();
@@ -163,6 +183,27 @@ fn main() {
         pool.execute(|| {
             handle_connection(stream, queue_clone);
         });
+    }
+}
+
+/// Function that checks the root of the HashMap to see if the item has been in the
+/// Unacked hashmap more than the desired time. If that is the case its moved back into the queue.
+fn requeue(job_queue: &JobQueue) {
+    let mut tree = job_queue.unacked_jobs.lock().unwrap();
+
+    while let Some(root) = tree.peek() {
+        if root.sent.unwrap().elapsed() < Duration::from_secs(30) {
+            break;
+        }
+
+        let root = match tree.pop() {
+            Some(root) => root,
+            None => return,
+        };
+
+        let job_id = root.id;
+        job_queue.pending_jobs.lock().unwrap().remove(&job_id);
+        job_queue.add_job(root);
     }
 }
 
